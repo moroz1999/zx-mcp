@@ -1,0 +1,29 @@
+{
+  "name": "zx-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Structured Z80 instruction reference MCP server",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/interfaces/mcp/server.ts",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "import:clrhome": "tsx src/infrastructure/import-from-clrhome.ts",
+    "smoke:mcp": "tsx scripts/smoke-mcp-client.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "cheerio": "^1.2.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@vitest/coverage-v8": "^4.1.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.2"
+  }
+}
