@@ -13,17 +13,11 @@ function extractText(result: unknown): string {
 }
 
 async function run(): Promise<void> {
-  const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
-
   const transport = new StdioClientTransport({
-    command: npmCommand,
-    args: ["run", "dev"],
+    command: "node",
+    args: ["--import", "tsx", "src/interfaces/mcp/server.ts"],
     cwd: process.cwd(),
-    stderr: "pipe",
-    env: {
-      ...process.env,
-      NODE_NO_WARNINGS: process.env.NODE_NO_WARNINGS ?? "1"
-    } as Record<string, string>
+    stderr: "pipe"
   });
 
   if (transport.stderr) {
@@ -44,14 +38,14 @@ async function run(): Promise<void> {
     console.log("Tools:", tools.tools.map((tool) => tool.name).join(", "));
 
     const exact = await client.callTool({
-      name: "instruction.lookup_exact",
+      name: "instruction_lookup_exact",
       arguments: { syntax: "EX DE,HL" }
     });
     console.log("\nlookup_exact(EX DE,HL):");
     console.log(extractText(exact));
 
     const search = await client.callTool({
-      name: "instruction.search",
+      name: "instruction_search",
       arguments: { operator: "BIT", registers: ["H"] }
     });
     const searchText = extractText(search);
@@ -59,7 +53,7 @@ async function run(): Promise<void> {
     console.log(`\nsearch(operator=BIT, registers=[H]) -> ${searchItems.length} rows`);
 
     const opcode = await client.callTool({
-      name: "instruction.lookup_opcode",
+      name: "instruction_lookup_opcode",
       arguments: { opcodeOrPrefix: "CB" }
     });
     const opcodeText = extractText(opcode);

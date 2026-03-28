@@ -1,4 +1,7 @@
-import { DatabaseSync } from "node:sqlite";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import initSqlJs, { type Database, type SqlValue } from "sql.js";
 import type { InstructionRecord } from "../domain/instruction.js";
 import type {
   InstructionRepository,
@@ -6,17 +9,22 @@ import type {
 } from "../domain/instruction-repository.js";
 import { normalizeInstructionSyntax, normalizeToken } from "../application/normalize.js";
 
+const sqlJsDistDir = fileURLToPath(new URL("../../node_modules/sql.js/dist/", import.meta.url));
+
 export class SqliteInstructionRepository implements InstructionRepository {
-  private readonly db: DatabaseSync;
+  private readonly filePath: string;
+  private db: Database | null = null;
+  private readonly ready: Promise<void>;
 
   public constructor(filePath = "data/z80.sqlite") {
-    this.db = new DatabaseSync(filePath);
-    this.db.exec("PRAGMA journal_mode = WAL;");
-    this.ensureSchema();
+    this.filePath = filePath;
+    this.ready = this.initialize();
   }
 
   public async findExactBySyntax(normalizedSyntax: string): Promise<InstructionRecord | null> {
-    const stmt = this.db.prepare(`
+    await this.ready;
+    const row = this.queryOne<InstructionCoreRow>(
+      `
       SELECT
         id,
         operator,
@@ -30,8 +38,9 @@ export class SqliteInstructionRepository implements InstructionRepository {
       FROM instructions
       WHERE syntax = ?
       LIMIT 1
-    `);
-    const row = stmt.get(normalizeInstructionSyntax(normalizedSyntax)) as InstructionCoreRow | undefined;
+      `,
+      [normalizeInstructionSyntax(normalizedSyntax)]
+    );
     if (!row) {
       return null;
     }
@@ -40,6 +49,7 @@ export class SqliteInstructionRepository implements InstructionRepository {
   }
 
   public async search(query: InstructionSearchQuery): Promise<InstructionRecord[]> {
+    await this.ready;
     let sql = `
       SELECT
         i.id,
@@ -54,7 +64,7 @@ export class SqliteInstructionRepository implements InstructionRepository {
       FROM instructions i
     `;
     const where: string[] = [];
-    const params: Array<string | number> = [];
+    const params: SqlValue[] = [];
 
     if (query.registers?.length) {
       for (const register of query.registers) {
@@ -125,18 +135,17 @@ export class SqliteInstructionRepository implements InstructionRepository {
     if (where.length) {
       sql += ` WHERE ${where.join(" AND ")}`;
     }
-
     sql += " ORDER BY i.syntax ASC";
 
-    const rows = this.db.prepare(sql).all(...params) as unknown as InstructionCoreRow[];
+    const rows = this.queryAll<InstructionCoreRow>(sql, params);
     return this.hydrateRecords(rows);
   }
 
   public async findByOpcode(opcodeOrPrefix: string): Promise<InstructionRecord[]> {
+    await this.ready;
     const wanted = normalizeToken(opcodeOrPrefix);
-    const rows = this.db
-      .prepare(
-        `
+    const rows = this.queryAll<InstructionCoreRow>(
+      `
       SELECT
         id,
         operator,
@@ -152,52 +161,34 @@ export class SqliteInstructionRepository implements InstructionRepository {
          OR opcode_prefix = ?
          OR opcode_full LIKE ?
       ORDER BY syntax ASC
-    `
-      )
-      .all(wanted, wanted, `%${wanted}%`) as unknown as InstructionCoreRow[];
-
+      `,
+      [wanted, wanted, `%${wanted}%`]
+    );
     return this.hydrateRecords(rows);
   }
 
   public async upsertMany(records: InstructionRecord[]): Promise<void> {
-    const upsertInstruction = this.db.prepare(`
-      INSERT INTO instructions (
-        id, operator, syntax, opcode_full, opcode_prefix, opcode_bytes, description, documentation_status, cycles_notes
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        operator = excluded.operator,
-        syntax = excluded.syntax,
-        opcode_full = excluded.opcode_full,
-        opcode_prefix = excluded.opcode_prefix,
-        opcode_bytes = excluded.opcode_bytes,
-        description = excluded.description,
-        documentation_status = excluded.documentation_status,
-        cycles_notes = excluded.cycles_notes
-    `);
-
-    const deleteRegisters = this.db.prepare("DELETE FROM instruction_registers WHERE instruction_id = ?");
-    const insertRegister = this.db.prepare("INSERT INTO instruction_registers (instruction_id, register) VALUES (?, ?)");
-
-    const deleteArguments = this.db.prepare("DELETE FROM instruction_arguments WHERE instruction_id = ?");
-    const insertArgument = this.db.prepare(`
-      INSERT INTO instruction_arguments (instruction_id, argument_index, argument)
-      VALUES (?, ?, ?)
-    `);
-
-    const deleteCycles = this.db.prepare("DELETE FROM instruction_cycles WHERE instruction_id = ?");
-    const insertCycle = this.db.prepare(`
-      INSERT INTO instruction_cycles (instruction_id, cycle_order, t_state)
-      VALUES (?, ?, ?)
-    `);
-
-    const deleteFlags = this.db.prepare("DELETE FROM instruction_flags WHERE instruction_id = ?");
-    const insertFlag = this.db.prepare("INSERT INTO instruction_flags (instruction_id, flag, effect) VALUES (?, ?, ?)");
-
-    const tx = (batch: InstructionRecord[]) => {
-      this.db.exec("BEGIN");
-      try {
-        for (const record of batch) {
-          upsertInstruction.run(
+    await this.ready;
+    const db = this.getDb();
+    db.exec("BEGIN");
+    try {
+      for (const record of records) {
+        this.run(
+          `
+          INSERT INTO instructions (
+            id, operator, syntax, opcode_full, opcode_prefix, opcode_bytes, description, documentation_status, cycles_notes
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            operator = excluded.operator,
+            syntax = excluded.syntax,
+            opcode_full = excluded.opcode_full,
+            opcode_prefix = excluded.opcode_prefix,
+            opcode_bytes = excluded.opcode_bytes,
+            description = excluded.description,
+            documentation_status = excluded.documentation_status,
+            cycles_notes = excluded.cycles_notes
+          `,
+          [
             record.id,
             normalizeToken(record.operator),
             normalizeInstructionSyntax(record.syntax),
@@ -207,50 +198,101 @@ export class SqliteInstructionRepository implements InstructionRepository {
             record.description,
             record.documentationStatus,
             record.cycles.notes?.trim() || null
-          );
+          ]
+        );
 
-          deleteRegisters.run(record.id);
-          for (const register of record.registers) {
-            insertRegister.run(record.id, normalizeToken(register));
-          }
-
-          deleteArguments.run(record.id);
-          for (const [index, argument] of record.arguments.entries()) {
-            insertArgument.run(record.id, index, normalizeToken(argument));
-          }
-
-          deleteCycles.run(record.id);
-          for (const [index, cycle] of record.cycles.tStates.entries()) {
-            insertCycle.run(record.id, index, cycle);
-          }
-
-          deleteFlags.run(record.id);
-          for (const flag of record.flags) {
-            insertFlag.run(record.id, normalizeToken(flag.flag), flag.effect);
-          }
+        this.run("DELETE FROM instruction_registers WHERE instruction_id = ?", [record.id]);
+        for (const register of record.registers) {
+          this.run("INSERT INTO instruction_registers (instruction_id, register) VALUES (?, ?)", [
+            record.id,
+            normalizeToken(register)
+          ]);
         }
-        this.db.exec("COMMIT");
-      } catch (error) {
-        this.db.exec("ROLLBACK");
-        throw error;
-      }
-    };
 
-    tx(records);
+        this.run("DELETE FROM instruction_arguments WHERE instruction_id = ?", [record.id]);
+        for (const [index, argument] of record.arguments.entries()) {
+          this.run(
+            `
+            INSERT INTO instruction_arguments (instruction_id, argument_index, argument)
+            VALUES (?, ?, ?)
+            `,
+            [record.id, index, normalizeToken(argument)]
+          );
+        }
+
+        this.run("DELETE FROM instruction_cycles WHERE instruction_id = ?", [record.id]);
+        for (const [index, cycle] of record.cycles.tStates.entries()) {
+          this.run(
+            `
+            INSERT INTO instruction_cycles (instruction_id, cycle_order, t_state)
+            VALUES (?, ?, ?)
+            `,
+            [record.id, index, cycle]
+          );
+        }
+
+        this.run("DELETE FROM instruction_flags WHERE instruction_id = ?", [record.id]);
+        for (const flag of record.flags) {
+          this.run("INSERT INTO instruction_flags (instruction_id, flag, effect) VALUES (?, ?, ?)", [
+            record.id,
+            normalizeToken(flag.flag),
+            flag.effect
+          ]);
+        }
+      }
+
+      db.exec("COMMIT");
+      await this.persist();
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   public close(): void {
-    this.db.close();
+    void this.ready.then(async () => {
+      await this.persist();
+      this.getDb().close();
+      this.db = null;
+    });
+  }
+
+  private async initialize(): Promise<void> {
+    const SQL = await initSqlJs({
+      locateFile: (file: string) => join(sqlJsDistDir, file)
+    });
+    const db = await this.loadDatabase(SQL);
+    this.db = db;
+    this.ensureSchema();
+    await this.persist();
+  }
+
+  private async loadDatabase(SQL: Awaited<ReturnType<typeof initSqlJs>>): Promise<Database> {
+    try {
+      const existing = await readFile(this.filePath);
+      return new SQL.Database(existing);
+    } catch {
+      return new SQL.Database();
+    }
+  }
+
+  private async persist(): Promise<void> {
+    if (!this.db) {
+      return;
+    }
+    await mkdir(dirname(this.filePath), { recursive: true });
+    const bytes = this.db.export();
+    await writeFile(this.filePath, Buffer.from(bytes));
   }
 
   private ensureSchema(): void {
-    this.db.exec("PRAGMA foreign_keys = ON;");
+    this.exec("PRAGMA foreign_keys = ON;");
     const columns = this.getInstructionColumnNames();
     if (columns && this.isLegacyInstructionSchema(columns)) {
       this.migrateFromLegacyJsonSchema();
     }
 
-    this.db.exec(`
+    this.exec(`
       CREATE TABLE IF NOT EXISTS instructions (
         id TEXT PRIMARY KEY,
         operator TEXT NOT NULL,
@@ -304,7 +346,7 @@ export class SqliteInstructionRepository implements InstructionRepository {
 
     const refreshedColumns = this.getInstructionColumnNames();
     if (refreshedColumns && !refreshedColumns.has("cycles_notes")) {
-      this.db.exec("ALTER TABLE instructions ADD COLUMN cycles_notes TEXT");
+      this.exec("ALTER TABLE instructions ADD COLUMN cycles_notes TEXT");
     }
   }
 
@@ -354,7 +396,10 @@ export class SqliteInstructionRepository implements InstructionRepository {
     const registersById = new Map<string, string[]>();
     const argumentsById = new Map<string, string[]>();
     const cyclesById = new Map<string, number[]>();
-    const flagsById = new Map<string, Array<{ flag: InstructionRecord["flags"][number]["flag"]; effect: InstructionRecord["flags"][number]["effect"] }>>();
+    const flagsById = new Map<
+      string,
+      Array<{ flag: InstructionRecord["flags"][number]["flag"]; effect: InstructionRecord["flags"][number]["effect"] }>
+    >();
 
     for (const row of registers) {
       const bucket = registersById.get(row.instruction_id) ?? [];
@@ -408,7 +453,7 @@ export class SqliteInstructionRepository implements InstructionRepository {
     if (ids.length === 0) {
       return [];
     }
-    return this.db.prepare(sql).all(...ids) as unknown as T[];
+    return this.queryAll<T>(sql, ids);
   }
 
   private createPlaceholders(count: number): string {
@@ -416,13 +461,13 @@ export class SqliteInstructionRepository implements InstructionRepository {
   }
 
   private getInstructionColumnNames(): Set<string> | null {
-    const table = this.db
-      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'instructions' LIMIT 1")
-      .get() as { name: string } | undefined;
+    const table = this.queryOne<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'instructions' LIMIT 1"
+    );
     if (!table) {
       return null;
     }
-    const rows = this.db.prepare("PRAGMA table_info(instructions)").all() as Array<{ name: string }>;
+    const rows = this.queryAll<Array<{ name: string }>[number]>("PRAGMA table_info(instructions)");
     return new Set(rows.map((row) => row.name));
   }
 
@@ -437,7 +482,8 @@ export class SqliteInstructionRepository implements InstructionRepository {
   }
 
   private migrateFromLegacyJsonSchema(): void {
-    const legacyRows = this.db.prepare(`
+    const legacyRows = this.queryAll<LegacyInstructionRow>(
+      `
       SELECT
         id,
         operator,
@@ -453,12 +499,13 @@ export class SqliteInstructionRepository implements InstructionRepository {
         documentation_status
       FROM instructions
       ORDER BY syntax ASC
-    `).all() as unknown as LegacyInstructionRow[];
+      `
+    );
 
-    this.db.exec("PRAGMA foreign_keys = OFF;");
-    this.db.exec("BEGIN");
+    this.exec("PRAGMA foreign_keys = OFF;");
+    this.exec("BEGIN");
     try {
-      this.db.exec(`
+      this.exec(`
         DROP TABLE IF EXISTS instruction_registers;
         DROP TABLE IF EXISTS instruction_arguments;
         DROP TABLE IF EXISTS instruction_cycles;
@@ -504,67 +551,77 @@ export class SqliteInstructionRepository implements InstructionRepository {
         );
       `);
 
-      const insertInstruction = this.db.prepare(`
-        INSERT INTO instructions_new (
-          id, operator, syntax, opcode_full, opcode_prefix, opcode_bytes, description, documentation_status, cycles_notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      const insertRegister = this.db.prepare("INSERT INTO instruction_registers (instruction_id, register) VALUES (?, ?)");
-      const insertArgument = this.db.prepare(`
-        INSERT INTO instruction_arguments (instruction_id, argument_index, argument)
-        VALUES (?, ?, ?)
-      `);
-      const insertCycle = this.db.prepare(`
-        INSERT INTO instruction_cycles (instruction_id, cycle_order, t_state)
-        VALUES (?, ?, ?)
-      `);
-      const insertFlag = this.db.prepare("INSERT INTO instruction_flags (instruction_id, flag, effect) VALUES (?, ?, ?)");
-
       for (const row of legacyRows) {
         const cycles = this.parseLegacyCycles(row.cycles_json);
-        insertInstruction.run(
-          row.id,
-          normalizeToken(row.operator),
-          normalizeInstructionSyntax(row.syntax),
-          normalizeToken(row.opcode_full),
-          row.opcode_prefix ? normalizeToken(row.opcode_prefix) : null,
-          row.opcode_bytes,
-          row.description,
-          row.documentation_status,
-          cycles.notes?.trim() || null
+        this.run(
+          `
+          INSERT INTO instructions_new (
+            id, operator, syntax, opcode_full, opcode_prefix, opcode_bytes, description, documentation_status, cycles_notes
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `,
+          [
+            row.id,
+            normalizeToken(row.operator),
+            normalizeInstructionSyntax(row.syntax),
+            normalizeToken(row.opcode_full),
+            row.opcode_prefix ? normalizeToken(row.opcode_prefix) : null,
+            row.opcode_bytes,
+            row.description,
+            row.documentation_status,
+            cycles.notes?.trim() || null
+          ]
         );
 
         for (const register of this.parseLegacyStringArray(row.registers_json)) {
-          insertRegister.run(row.id, normalizeToken(register));
+          this.run("INSERT INTO instruction_registers (instruction_id, register) VALUES (?, ?)", [
+            row.id,
+            normalizeToken(register)
+          ]);
         }
 
         for (const [index, argument] of this.parseLegacyStringArray(row.arguments_json).entries()) {
-          insertArgument.run(row.id, index, normalizeToken(argument));
+          this.run(
+            `
+            INSERT INTO instruction_arguments (instruction_id, argument_index, argument)
+            VALUES (?, ?, ?)
+            `,
+            [row.id, index, normalizeToken(argument)]
+          );
         }
 
         for (const [index, cycle] of cycles.tStates.entries()) {
-          insertCycle.run(row.id, index, cycle);
+          this.run(
+            `
+            INSERT INTO instruction_cycles (instruction_id, cycle_order, t_state)
+            VALUES (?, ?, ?)
+            `,
+            [row.id, index, cycle]
+          );
         }
 
         for (const flag of this.parseLegacyFlagRows(row.flags_json)) {
-          insertFlag.run(row.id, normalizeToken(flag.flag), flag.effect);
+          this.run("INSERT INTO instruction_flags (instruction_id, flag, effect) VALUES (?, ?, ?)", [
+            row.id,
+            normalizeToken(flag.flag),
+            flag.effect
+          ]);
         }
       }
 
-      this.db.exec(`
+      this.exec(`
         DROP TABLE instructions;
         ALTER TABLE instructions_new RENAME TO instructions;
       `);
-      this.db.exec("COMMIT");
+      this.exec("COMMIT");
     } catch (error) {
-      this.db.exec("ROLLBACK");
+      this.exec("ROLLBACK");
       throw error;
     } finally {
-      this.db.exec("PRAGMA foreign_keys = ON;");
+      this.exec("PRAGMA foreign_keys = ON;");
     }
   }
 
-  private parseLegacyStringArray(raw: string): string[] {
+  private parseLegacyStringArray(raw: unknown): string[] {
     const parsed = this.tryParseJson(raw);
     if (!Array.isArray(parsed)) {
       return [];
@@ -572,7 +629,7 @@ export class SqliteInstructionRepository implements InstructionRepository {
     return parsed.filter((value): value is string => typeof value === "string");
   }
 
-  private parseLegacyCycles(raw: string): { tStates: number[]; notes?: string } {
+  private parseLegacyCycles(raw: unknown): { tStates: number[]; notes?: string } {
     const parsed = this.tryParseJson(raw);
     if (!parsed || typeof parsed !== "object") {
       return { tStates: [] };
@@ -586,7 +643,7 @@ export class SqliteInstructionRepository implements InstructionRepository {
     return { tStates, notes };
   }
 
-  private parseLegacyFlagRows(raw: string): Array<{ flag: string; effect: string }> {
+  private parseLegacyFlagRows(raw: unknown): Array<{ flag: string; effect: string }> {
     const parsed = this.tryParseJson(raw);
     if (!Array.isArray(parsed)) {
       return [];
@@ -606,12 +663,54 @@ export class SqliteInstructionRepository implements InstructionRepository {
       .filter((value): value is { flag: string; effect: string } => Boolean(value));
   }
 
-  private tryParseJson(raw: string): unknown {
+  private tryParseJson(raw: unknown): unknown {
+    if (typeof raw !== "string") {
+      return null;
+    }
     try {
       return JSON.parse(raw);
     } catch {
       return null;
     }
+  }
+
+  private exec(sql: string): void {
+    this.getDb().exec(sql);
+  }
+
+  private run(sql: string, params: SqlValue[] = []): void {
+    const stmt = this.getDb().prepare(sql);
+    try {
+      stmt.run(params);
+    } finally {
+      stmt.free();
+    }
+  }
+
+  private queryOne<T>(sql: string, params: SqlValue[] = []): T | null {
+    const rows = this.queryAll<T>(sql, params);
+    return rows[0] ?? null;
+  }
+
+  private queryAll<T>(sql: string, params: SqlValue[] = []): T[] {
+    const stmt = this.getDb().prepare(sql);
+    try {
+      stmt.bind(params);
+      const rows: T[] = [];
+      while (stmt.step()) {
+        rows.push(stmt.getAsObject() as T);
+      }
+      return rows;
+    } finally {
+      stmt.free();
+    }
+  }
+
+  private getDb(): Database {
+    if (!this.db) {
+      throw new Error("SQLite database is not initialized.");
+    }
+    return this.db;
   }
 }
 
@@ -654,10 +753,10 @@ interface LegacyInstructionRow {
   id: string;
   operator: string;
   syntax: string;
-  registers_json: string;
-  arguments_json: string;
-  cycles_json: string;
-  flags_json: string;
+  registers_json: unknown;
+  arguments_json: unknown;
+  cycles_json: unknown;
+  flags_json: unknown;
   opcode_full: string;
   opcode_prefix: string | null;
   opcode_bytes: number;

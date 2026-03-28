@@ -17,7 +17,7 @@ Use-cases:
 
 ### `src/infrastructure`
 
-- SQLite repository implementation with relational indexed schema (no JSON payload columns)
+- SQLite repository implementation (sql.js / SQLite WASM) with relational indexed schema (no JSON payload columns)
 - parser service for `clrhome` opcode table HTML
 - import command (`import-from-clrhome.ts`) to ingest source data
 - seed data for local development fallback

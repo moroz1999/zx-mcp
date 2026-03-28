@@ -27,16 +27,22 @@ npm install
 npm run import:clrhome
 ```
 
-3. Start the MCP server (stdio transport):
+3. Build the server:
 
 ```bash
-npm run dev
+npm run build
+```
+
+4. Start the MCP server (stdio transport):
+
+```bash
+node dist/interfaces/mcp/server.js
 ```
 
 By default, the server uses `data/z80.sqlite`.
-Set `ZX_MCP_DB_PATH` to override the database path.
+`ZX_MCP_DB_PATH` is optional and only needed for a custom database path.
 
-## Connect in VS Code
+## Connect in VS Code (Chat / Agent mode)
 
 1. Open the workspace in VS Code.
 2. Run `MCP: Open Workspace Folder Configuration` from Command Palette.
@@ -47,12 +53,11 @@ Set `ZX_MCP_DB_PATH` to override the database path.
   "servers": {
     "zxMcp": {
       "type": "stdio",
-      "command": "npm",
-      "args": ["run", "dev"],
-      "cwd": "/path/to/zx-mcp/",
-      "env": {
-        "ZX_MCP_DB_PATH": "/path/to/zx-mcp/data/z80.sqlite"
-      }
+      "command": "node",
+      "args": [
+        "dist/interfaces/mcp/server.js"
+      ],
+      "cwd": "/path/to/zx-mcp/"
     }
   }
 }
@@ -63,3 +68,14 @@ Set `ZX_MCP_DB_PATH` to override the database path.
    - `instruction_lookup_exact`
    - `instruction_search`
    - `instruction_lookup_opcode`
+
+## Connect in Codex (and Codex Extension for VS Code)
+
+Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.zxMcp]
+command = "node"
+args = ["dist/interfaces/mcp/server.js"]
+cwd = "/path/to/zx-mcp/"
+```

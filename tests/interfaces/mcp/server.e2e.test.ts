@@ -28,13 +28,12 @@ describe("MCP server e2e", () => {
 
     client = new Client({ name: "zx-mcp-tests", version: "0.1.0" });
     transport = new StdioClientTransport({
-      command: "npm.cmd",
-      args: ["run", "dev"],
+      command: "node",
+      args: ["--import", "tsx", "src/interfaces/mcp/server.ts"],
       cwd: process.cwd(),
       env: {
         ...process.env,
-        ZX_MCP_DB_PATH: dbPath,
-        NODE_NO_WARNINGS: "1"
+        ZX_MCP_DB_PATH: dbPath
       } as Record<string, string>,
       stderr: "pipe"
     });
@@ -50,28 +49,28 @@ describe("MCP server e2e", () => {
   it("registers expected tools", async () => {
     const listed = await client.listTools();
     const names = listed.tools.map((x) => x.name);
-    expect(names).toContain("instruction.lookup_exact");
-    expect(names).toContain("instruction.search");
-    expect(names).toContain("instruction.lookup_opcode");
+    expect(names).toContain("instruction_lookup_exact");
+    expect(names).toContain("instruction_search");
+    expect(names).toContain("instruction_lookup_opcode");
   });
 
   it("supports exact/search/opcode calls", async () => {
     const exact = await client.callTool({
-      name: "instruction.lookup_exact",
+      name: "instruction_lookup_exact",
       arguments: { syntax: " ex  hl, de " }
     });
     const exactPayload = parseToolText(exact) as { syntax: string };
     expect(exactPayload.syntax).toBe("EX HL,DE");
 
     const search = await client.callTool({
-      name: "instruction.search",
+      name: "instruction_search",
       arguments: { operator: "bit", registers: ["h"] }
     });
     const searchPayload = parseToolText(search) as Array<{ syntax: string }>;
     expect(searchPayload.map((x) => x.syntax)).toContain("BIT 7,H");
 
     const opcode = await client.callTool({
-      name: "instruction.lookup_opcode",
+      name: "instruction_lookup_opcode",
       arguments: { opcodeOrPrefix: "cb" }
     });
     const opcodePayload = parseToolText(opcode) as Array<{ syntax: string }>;

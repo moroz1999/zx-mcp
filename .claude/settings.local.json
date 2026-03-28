@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node dist/interfaces/mcp/server.js)",
+      "Bash(node \"E:/projects/zx-mcp/dist/interfaces/mcp/server.js\")"
+    ]
+  }
+}
